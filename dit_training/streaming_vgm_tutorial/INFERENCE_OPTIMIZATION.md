@@ -400,3 +400,213 @@ frames per second
 ## 20. 追加总结
 
 Streaming VGM 的下一阶段优化重点不是单纯“加 KV cache”，而是把 KV cache、chunk sparsity、显存预算、SP/CP 切分和长序列 benchmark 统一设计；只有这样，模型才能从 demo 级流式生成走向真实实时服务。
+
+## 21. 追加分析与纠错：对当前 Streaming VGM Conclusion 的校准
+
+你给出的 conclusion 大方向是合理的，但有几处需要更精确地表述，否则容易把“当前常见工程形态”误认为“已经完全收敛的最终形态”。
+
+### 21.1 关于“架构基本收敛”
+
+原判断：
+
+```text
+目前流式视频生成的架构基本收敛：chunk 间自回归，chunk 内双向注意力。
+```
+
+校准后更准确的说法是：
+
+```text
+当前较实用的 streaming VGM 架构正在向 chunk-level autoregressive + intra-chunk bidirectional/parallel denoising 的方向集中，但还不能说完全收敛。
+```
+
+原因是：
+
+- chunk 间自回归确实符合 streaming latency 和 KV cache 复用需求。
+- chunk 内双向注意力能提高局部质量和运动一致性，因为同一个 chunk 内的帧可以互相看。
+- 但仍存在其他路线，例如纯 causal token 生成、diffusion chunk refinement、latent consistency 少步生成、world-model memory augmented generation。
+- 不同产品目标会改变架构选择：低延迟交互、长视频一致性、可编辑性、世界模型预测，对 attention pattern 和 memory 设计要求不同。
+
+一句话纠错：可以说“工程上趋向 chunk 间 AR、chunk 内并行/双向”，不要说“已经完全收敛”。
+
+### 21.2 关于 workload 类似 dLLM / batched LLM
+
+原判断：
+
+```text
+workload 有点类似 dLLM 或带 batch 的 LLM，attention 部分有所不同，需要 KV cache。
+```
+
+这个判断基本正确，但要补充三个关键差异：
+
+1. **视频 chunk token 数远大于 LLM 单 decode token**：LLM decode 常见是每请求每步 1 个 token，而 streaming VGM 每步可能生成一个 chunk，chunk 内有大量时空 token。
+2. **VGM 还有 VAE decode / video encode**：LLM serving 主要是 token decode，VGM serving 还要把 latent 变成帧并编码输出。
+3. **attention pattern 更复杂**：LLM 多是严格 causal，VGM 可能是 chunk 间 causal、chunk 内 bidirectional、跨 chunk sparse/reference attention 混合。
+
+更准确说法：
+
+```text
+Streaming VGM serving 在系统形态上类似 LLM 的 prefill + decode，但 decode 单位往往是 video chunk 而不是单 token，因此 attention、VAE decode、显存和调度压力都更接近“带大 token block 的多模态 serving”。
+```
+
+### 21.3 关于“有 KV cache 但依然 compute-bound”
+
+原判断：
+
+```text
+需要 KV cache，但由于单 chunk token 量很大，所以依然是 compute-bound。
+```
+
+这个判断有道理，但应加条件：
+
+- 如果 chunk 内 full attention 或 dense DiT block 占主导，确实可能 compute-bound。
+- 如果 KV cache 很大、batch 很小、生成时间很长，也可能 memory-bandwidth-bound 或 capacity-bound。
+- 如果 VAE decode/video encode 没有 overlap，端到端可能不是 DiT compute-bound，而是 decode/encode-bound。
+- 如果采用 sparse attention 但 kernel 不理想，可能变成 memory-bound 或 launch-overhead-bound。
+
+更准确说法：
+
+```text
+KV cache 解决的是跨 chunk 历史重算问题，但不能消除 chunk 内大量 token 的 DiT 计算；因此核心模型 forward 往往仍可能 compute-bound，而端到端系统还可能受 KV cache 显存、VAE decode、video encode 和调度开销限制。
+```
+
+一句话纠错：不要只说“依然 compute-bound”，要区分模型 forward、attention kernel、VAE decode 和 serving 端到端瓶颈。
+
+### 21.4 关于 Forcing 系列训练方法
+
+原判断：
+
+```text
+训练方法以 forcing 系列为代表，从双向注意力模型蒸馏为自回归流式是学术界较多探讨的方案。
+```
+
+这个方向基本合理，但需要更宽一点：
+
+- Teacher forcing 是自回归训练的基础，即训练时喂真实历史，让模型预测未来。
+- Scheduled forcing / scheduled sampling 类方法试图缓解训练时真实历史和推理时模型生成历史之间的 exposure bias。
+- 从 bidirectional/full-context teacher 蒸馏到 streaming/causal student 是很自然的方案，因为 teacher 质量更好，student latency 更低。
+- 但 streaming VGM 训练不一定只靠 forcing，也可能结合 diffusion distillation、consistency distillation、flow matching distillation、trajectory distillation、online rollout loss。
+
+更准确说法：
+
+```text
+Streaming VGM 的训练通常需要处理 teacher forcing 与 rollout mismatch；从 full-context/bidirectional teacher 蒸馏到 causal/chunk-autoregressive student 是重要路线，但还应结合少步蒸馏、consistency/flow matching 和在线 rollout 约束。
+```
+
+### 21.5 关于质量问题：动作切换、场景连贯、背景抖动
+
+原判断：
+
+```text
+切换场景或动作的连贯性依然存在问题，背景抖动依然存在；双向模型背景可能更稳定。
+```
+
+这个判断很可能是对的，原因包括：
+
+- 流式模型只能看历史，无法像离线双向模型那样用未来帧反向约束当前帧。
+- chunk 边界处容易出现 motion discontinuity，因为前后 chunk 的 denoising / generation 状态不完全共享。
+- sliding window 会遗忘远期背景布局，导致背景缓慢漂移。
+- VAE decode 或 temporal upsampler 也可能放大轻微 latent 抖动。
+- 双向模型在一个完整窗口内能利用未来帧平滑背景和运动，因此短片段稳定性通常更有优势。
+
+更准确说法：
+
+```text
+Streaming 模型在长程一致性上天然比 full-context 双向模型更难，因为它少了未来上下文；背景抖动和动作切换不连贯可能来自模型能力、cache/memory 设计、chunk 边界、VAE 解码和训练推理不一致共同作用。
+```
+
+可排查方向：
+
+- 单独比较 latent 空间抖动和 pixel 空间抖动，区分 DiT 问题和 VAE decode 问题。
+- 固定 prompt 和 seed，比较 full-context teacher、streaming student、不同 window size 的背景漂移。
+- 对 chunk boundary 前后计算 optical flow / feature similarity。
+- 加入 background memory 或 keyframe refresh，看是否缓解抖动。
+
+### 21.6 关于能力问题：Sliding Window 理论无限长但能力有限
+
+原判断：
+
+```text
+longlive 的 sliding window 理论支持无限长生成，但 sliding window 本质能力有限；简单长视频够用，真正有长期记忆需求的 world model 不够用。
+```
+
+这个判断很关键，而且应该保留。
+
+Sliding window 的“无限长”只是系统层面的无限：模型可以一直运行，因为显存不会随时间无限增长；但能力层面不是无限，因为窗口外的信息被截断或压缩。
+
+更准确说法：
+
+```text
+Sliding window 解决的是显存和延迟可持续问题，不等于解决长期记忆问题；对于简单连续运动足够，但对于需要长期状态、事件因果和世界一致性的任务，需要额外 memory 机制。
+```
+
+可能的补强方向：
+
+- long-term memory tokens。
+- keyframe bank。
+- scene graph / object state memory。
+- world state latent。
+- retrieval memory。
+- periodic summarization。
+- background map / identity cache。
+
+一句话纠错：sliding window 让生成“跑得久”，不保证模型“记得久”。
+
+### 21.7 关于效率问题：量化、少步、sliding window 和 KV cache 占用
+
+原判断：
+
+```text
+先进 streaming 生成模型通常结合量化、少步、sliding window 等多种优化，可达 30-50 fps，但仍有提高空间，KV cache 占用也不小，约 10GB 级别。
+```
+
+这个判断方向合理，但数字需要谨慎表述：
+
+- 30-50 fps 强依赖分辨率、帧率定义、生成 chunk size、GPU 型号、模型大小、VAE 是否计入、是否 batch、多用户并发和质量设置。
+- KV cache 约 10GB 级别是可能的，但也强依赖层数、heads、head_dim、历史 token 数、精度、batch 和是否保留 cross-attention cache。
+- 有些系统宣传 fps 只统计 DiT latent generation，不统计 VAE decode、video encode 和网络发送。
+
+更准确说法：
+
+```text
+先进 streaming VGM 需要组合量化、少步生成、sliding window、KV cache、chunk 调度和 VAE/encode overlap 才能达到高 fps；具体 fps 和 KV cache 显存必须在明确分辨率、模型规模、硬件、是否端到端计时的条件下报告。
+```
+
+建议报告指标：
+
+```text
+latent generation fps
+end-to-end pixel fps
+time-to-first-frame
+per-frame latency p50/p90/p99
+KV cache GB/request
+max concurrent requests/GPU
+quality under same fps
+```
+
+### 21.8 更严谨的改写版 Conclusion
+
+可以把原 conclusion 改写成：
+
+```text
+当前实用的 streaming VGM 架构正在向 chunk 间自回归、chunk 内并行或双向建模的方向集中；它在 serving 形态上类似 LLM 的 prefill + decode，但由于每个 video chunk 内 token 数很大，并且还包含 VAE decode、video encode 和复杂 attention pattern，因此不能简单等同于 LLM decode。
+
+KV cache 是 streaming VGM 的必要组件，它减少跨 chunk 历史重算，但 chunk 内 DiT 计算仍然很重，端到端性能还会受到 KV cache 显存、VAE decode、视频编码、调度和并发的共同限制。
+
+训练上，teacher forcing、scheduled forcing、rollout loss，以及从 full-context/bidirectional teacher 蒸馏到 causal/chunk-autoregressive student，都是解决 streaming 训练推理不一致的重要路线；未来还可能结合 diffusion/flow/consistency distillation。
+
+质量上，流式模型仍容易出现动作切换不连贯、chunk 边界不稳定和背景抖动；这既可能来自模型能力，也可能来自 sliding window 遗忘、cache/memory 设计不足、VAE decode 放大误差和训练推理不一致。双向模型短窗口内背景更稳定是合理现象，因为它能使用未来帧约束当前帧。
+
+能力上，sliding window 只保证系统能无限运行，不保证模型具备无限长期记忆；对于简单长视频可能够用，但对于 world model、长程交互和复杂状态保持，需要 keyframe memory、semantic memory、object/state memory 或 retrieval memory 等额外机制。
+
+效率上，当前高 fps streaming 方案通常依赖量化、少步生成、sliding window、KV cache、chunk 调度和 decode overlap 等组合优化；fps 和 KV cache 占用必须在明确硬件、分辨率、模型规模、是否端到端计时和并发数的前提下报告，否则数字不可直接比较。
+```
+
+### 21.9 下一步研究问题清单
+
+- 如何在 KV cache 中保留背景稳定性和主体身份最相关的 token。
+- 如何在 chunk 内使用真正高效的 sparse attention kernel，而不是 dense mask。
+- 如何设计同时服务训练和推理的 streaming attention pattern。
+- 如何为超长视频设计语义 memory，而不是只依赖 sliding window。
+- 如何构建长序列可控性 benchmark，衡量背景漂移、身份保持、动作切换和交互响应。
+- 如何在显存预算下做 serving admission control、cache eviction 和 request-aware SP/CP。
+- 如何区分 DiT latent 抖动、VAE decode 抖动和视频编码造成的视觉抖动。
